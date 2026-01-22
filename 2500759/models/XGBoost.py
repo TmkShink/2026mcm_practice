@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 import os
 import joblib
+import shap
+import traceback
 
 def load_noc_mapping(data_dir):
     """
@@ -18,15 +20,9 @@ def load_noc_mapping(data_dir):
     
     df = pd.read_csv(athletes_path)
     # Get most frequent Team name for each NOC code
-    # We want a map: NOC Data (Code) -> Medal Data (Name)
-    # But Medal Data "NOC" is Name. 
-    # Check consistency: Medal Data "United States". Athletes "United States" -> NOC "USA".
-    
-    # We will try to map Code -> Name
     mapping = df.groupby('NOC')['Team'].agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]).to_dict()
     
     # Manual fixes for common discrepancies if needed
-    # (Based on standard datasets)
     mapping['USA'] = 'United States'
     mapping['GBR'] = 'Great Britain'
     mapping['CHN'] = 'China'
@@ -74,15 +70,10 @@ def main():
     print(f"Loaded LSTM Features: {df_lstm_features.shape}")
     
     # --- Fix NOC Mismatch ---
-    # df_pca_scores has Codes (USA), df_lstm_features has Names (United States)
-    # We need to add 'NOC_Name' to df_pca_scores 
-    
     noc_map = load_noc_mapping(data_dir)
     print(f"Loaded NOC mapping for {len(noc_map)} codes.")
     
     df_pca_scores['NOC'] = df_pca_scores['NOC_Code'].map(noc_map)
-    
-    # Fill missing or identity if map fails (some codes might just be names?)
     df_pca_scores['NOC'] = df_pca_scores['NOC'].fillna(df_pca_scores['NOC_Code'])
     
     # Check overlap
@@ -107,29 +98,16 @@ def main():
     df_medals = pd.read_csv(os.path.join(data_dir, 'summerOly_medal_counts.csv'))
     
     # 2. Merge Data
-    # Base: df_lstm_features (contains NOC, Year, Trends, Vectors)
-    # Join PCA (on NOC)
-    # We join on 'NOC' (Name)
-    
     df_merged = pd.merge(df_lstm_features, df_pca_scores, on='NOC', how='inner')
     
     # Join Actual Medals (Target)
-    # Join on Name and Year
     df_merged = pd.merge(df_merged, df_medals[['NOC', 'Year', 'Gold', 'Total']], on=['NOC', 'Year'], how='left', suffixes=('_feat', '_target'))
-    
-    # Use 'Gold_feat' (from LSTM input vector) as ground truth if available and aligns with Year.
-    # Note: LSTM output 'Gold' is the actual gold for that year (item['feat_gold']).
-    # So we can use it.
-    
-    # Ensure we use the correct target column
-    # For training (Year < 2028), we use the actual values.
-    # 'Gold_feat' columns are from LSTM generation which passed through real values.
     
     # Rename for clarity
     if 'Gold_feat' in df_merged.columns:
         df_merged['Gold_Actual'] = df_merged['Gold_feat']
         df_merged['Total_Actual'] = df_merged['Total_feat']
-    elif 'Gold' in df_merged.columns: # If suffix wasn't added
+    elif 'Gold' in df_merged.columns: 
         df_merged['Gold_Actual'] = df_merged['Gold']
         df_merged['Total_Actual'] = df_merged['Total']
         
@@ -145,13 +123,16 @@ def main():
     # FEATURES for XGBoost (Equation 7)
     feature_cols = ['LSTM_Gold_Trend', 'LSTM_Total_Trend', 'Is_Host', 'Alpha'] + [c for c in df_pca_scores.columns if 'PC' in c]
     
+    # Force convert features to numeric to avoid object dtypes
+    for col in feature_cols:
+         df_merged[col] = pd.to_numeric(df_merged[col], errors='coerce')
+
     # Define Tasks
     tasks = [
         {'target': 'Gold_Actual', 'col_name': 'Gold'},
         {'target': 'Total_Actual', 'col_name': 'Total'}
     ]
     
-    # For prediction, we need the row where Year == 2028
     df_2028 = df_merged[df_merged['Year'] == 2028].copy()
     
     if df_2028.empty:
@@ -177,9 +158,12 @@ def main():
         X_train = df_train[feature_cols]
         y_train = df_train[target_col]
         
+        # Ensure pure numeric
+        X_train = X_train.astype(float)
+        
         print(f"  Training samples: {len(X_train)}")
         
-        X_pred_2028 = df_2028[feature_cols] # 2028 features (Trends from LSTM, Host info)
+        X_pred_2028 = df_2028[feature_cols].copy().astype(float) # 2028 features (Trends from LSTM, Host info)
         
         # Grid Search
         print("  Running Grid Search CV...")
@@ -199,7 +183,69 @@ def main():
         grid_search.fit(X_train, y_train)
         
         best_params = grid_search.best_params_
+        best_model = grid_search.best_estimator_
         print(f"  Best Params: {best_params}")
+        
+      # --- SHAP Calculation (The Monkey Patch Fix) ---
+        print(f"  Calculating SHAP values for {result_name}...")
+        try:
+            import json
+            import types
+            
+            # 1. 提取 booster
+            mybooster = best_model.get_booster()
+            
+            # 2. 获取原始的配置字符串 (这里面肯定有方括号)
+            config_str = mybooster.save_config()
+            
+            # 3. 解析为 JSON 并修正
+            config_dict = json.loads(config_str)
+            
+            # 尝试定位并修改 base_score
+            try:
+                # 路径通常是 learner -> learner_model_param -> base_score
+                raw_score = config_dict['learner']['learner_model_param']['base_score']
+                print(f"  [Debug] Intercepted raw base_score: {raw_score}")
+                
+                if isinstance(raw_score, str) and raw_score.startswith('[') and raw_score.endswith(']'):
+                    fixed_score = raw_score[1:-1]
+                    config_dict['learner']['learner_model_param']['base_score'] = fixed_score
+                    print(f"  [Debug] Patched in-memory base_score to: {fixed_score}")
+            except KeyError:
+                print("  [Warning] Could not find base_score in config, skipping patch.")
+            
+            # 4. 生成修正后的 JSON 字符串
+            fixed_config_str = json.dumps(config_dict)
+            
+            # 5. 【核心大招】覆盖 mybooster 的 save_config 方法
+            # 这样当 SHAP 调用 save_config 时，它拿到的就是我们改好的字符串，而不是 XGBoost 重新生成的带括号版本
+            def custom_save_config(self):
+                return fixed_config_str
+            
+            # 将这个自定义方法绑定到 mybooster 实例上
+            mybooster.save_config = types.MethodType(custom_save_config, mybooster)
+            
+            # 6. 设置特征名 (防止 SHAP 找不到名字)
+            mybooster.feature_names = feature_cols
+            
+            # 7. 计算 SHAP
+            # 这次 SHAP 就会读到我们伪造的 fixed_config_str
+            explainer = shap.TreeExplainer(mybooster)
+            shap_values = explainer.shap_values(X_train)
+            
+            # 8. 保存结果
+            df_shap = X_train.copy()
+            for i, col in enumerate(feature_cols):
+                 df_shap[f'SHAP_{col}'] = shap_values[:, i]
+            
+            shap_out_path = os.path.join(processed_dir, f'shap_values_{result_name}.csv')
+            df_shap.to_csv(shap_out_path, index=False)
+            print(f"  SHAP values saved to {shap_out_path}")
+            
+        except Exception as e:
+            print(f"  Error calculating SHAP: {e}")
+            import traceback
+            traceback.print_exc()
         
         # Bootstrap
         print("  Running Bootstrap (1000 iterations)...")

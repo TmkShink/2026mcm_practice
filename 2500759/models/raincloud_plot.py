@@ -66,7 +66,7 @@ pt.RainCloud(
     orient = "v",        # 垂直方向 (v=vertical, h=horizontal)
     alpha = 0.6,         # 透明度
     dodge = True,        # 避让
-    pointplot = True,    # 显示散点(雨)
+    pointplot = False,   # 不显示连接均值的折线
     move = .2,           # 散点和小提琴的距离
     jitter = 0.8         # 散点的抖动幅度
 )
